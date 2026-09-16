@@ -1,613 +1,305 @@
-import os
-import sys
-import json
-import hashlib
-import shutil
-import subprocess
-import logging
-import argparse
-import tempfile
-import re
+import os, sys, json, hashlib, shutil, subprocess, logging, argparse, tempfile, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image, ImageChops
 
+logging.basicConfig(level=logging.INFO, format="%(message)s",
+                    handlers=[logging.StreamHandler(sys.stdout)])
+log = logging.getLogger("Converter")
 
-# Настройка логов, чтобы всё писалось в консоль
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-
-# Логгер, которым будем писать сообщения
-logger = logging.getLogger("DocumentConverter")
-
-# Тут лежат расширения документов
-DOC_EXTENSIONS = {".docx", ".doc", ".xls", ".xlsx"}
-# А тут расширения картинок
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff", ".gif"}
-# Всё вместе это то, что программа умеет
-SUPPORTED_EXTENSIONS = DOC_EXTENSIONS | IMAGE_EXTENSIONS
+DOCS = {".docx", ".doc", ".xls", ".xlsx"}
+IMGS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff", ".gif"}
+ALL = DOCS | IMGS
 
 
-def strip_hash_prefix(filename):
-    """Убирает 4 символа хэша в начале имени."""
-    return re.sub(r"^[a-fA-F0-9]{4}_", "", filename)
+class DB:
+    """Простая JSON база."""
 
-
-class DatabaseManager:
-    """Работает с JSON базой: читает, пишет, удаляет."""
-
-    def __init__(self, db_path, list_json_path=None):
-        """Запоминает пути и сразу грузит данные."""
-        self.db_path = db_path
-        self.list_json_path = list_json_path
+    def __init__(self, path, list_path=None):
+        """Запоминает пути и грузит данные."""
+        self.path = path
+        self.list_path = list_path
         self.data = self.load()
 
     def load(self):
-        """Читает JSON. Если нет файла, то пустой словарь."""
-        # Если файла нет, отдаём пусто
-        if not os.path.exists(self.db_path):
+        """Читает JSON или даёт пустой словарь."""
+        if not os.path.exists(self.path):
             return {}
-
         try:
-            # Открываем и читаем
-            with open(self.db_path, "r", encoding="utf-8") as file:
-                data = json.load(file)
-                # Должен быть словарь
-                return data if isinstance(data, dict) else {}
-        except Exception as error:
-            # Если сломалось, пишем и пусто
-            logger.warning("Не удалось прочитать JSON: %s", error)
+            with open(self.path, encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception as e:
+            log.warning("JSON не прочитан: %s", e)
             return {}
 
     def save(self):
-        """Сохраняет базу в файл."""
-        # Делаем папку, если нет
-        directory = os.path.dirname(os.path.abspath(self.db_path))
-        os.makedirs(directory, exist_ok=True)
+        """Пишет базу в файл."""
+        self._write(self.path, self.data)
+        if self.list_path:
+            self._write(self.list_path, sorted(self.data))
 
-        # Пишем во временный файл, потом заменяем
-        temporary_path = self.db_path + ".tmp"
-        with open(temporary_path, "w", encoding="utf-8") as file:
-            json.dump(self.data, file, ensure_ascii=False, indent=4)
-            file.write("\n")
+    def _write(self, path, data):
+        """Пишет данные во временный файл и заменяет."""
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+            f.write("\n")
+        os.replace(tmp, path)
 
-        os.replace(temporary_path, self.db_path)
-
-        # Ещё сохраняем список, если надо
-        if self.list_json_path:
-            self.save_list()
-
-    def save_list(self):
-        """Сохраняет JSON со списком имён картинок."""
-        # Если путь не задан, выходим
-        if not self.list_json_path:
-            return
-
-        # Делаем папку, если нет
-        directory = os.path.dirname(os.path.abspath(self.list_json_path))
-        os.makedirs(directory, exist_ok=True)
-
-        # Берём ключи и сортируем
-        images_list = sorted(list(self.data.keys()))
-
-        # Пишем через временный файл
-        temporary_path = self.list_json_path + ".tmp"
-        with open(temporary_path, "w", encoding="utf-8") as file:
-            json.dump(images_list, file, ensure_ascii=False, indent=4)
-            file.write("\n")
-
-        os.replace(temporary_path, self.list_json_path)
-
-    def remove_photos(self, image_names, output_dir):
-        """Удаляет картинки и записи о них."""
-        # Идём по именам
-        for image_name in image_names:
-            image_path = os.path.join(output_dir, image_name)
-
+    def remove(self, names, out_dir):
+        """Удаляет картинки и записи."""
+        for n in names:
+            p = os.path.join(out_dir, n)
             try:
-                # Если файл есть, удаляем
-                if os.path.isfile(image_path):
-                    os.remove(image_path)
-            except OSError as error:
-                # Если не вышло, пишем
-                logger.warning("Не удалось удалить %s: %s", image_path, error)
-
-            # Убираем из базы
-            self.data.pop(image_name, None)
+                if os.path.isfile(p):
+                    os.remove(p)
+            except OSError as e:
+                log.warning("Не удалить %s: %s", p, e)
+            self.data.pop(n, None)
 
 
-def calculate_sha256(file_path):
-    """Считает хэш файла."""
-    sha256 = hashlib.sha256()
-
-    # Читаем файл кусками
-    with open(file_path, "rb") as file:
-        while True:
-            chunk = file.read(1024 * 1024)
-            # Файл кончился
-            if not chunk:
-                break
-            sha256.update(chunk)
-
-    return sha256.hexdigest()
-
-
-def check_dependencies():
-    """Проверяет, что есть libreoffice и pdftoppm."""
-    missing = []
-
-    # Смотрим каждую программу
-    for command in ("libreoffice", "pdftoppm"):
-        if shutil.which(command) is None:
-            missing.append(command)
-
-    # Если чего то нет, ругаемся
-    if missing:
-        raise RuntimeError(
-            "Не найдены программы: " + ", ".join(missing) +
-            ". Установите LibreOffice и poppler-utils."
-        )
-
-
-def crop_image_bbox(img, margin=0):
-    """Обрезает белые поля у картинки."""
-    try:
-        # Делаем RGB и белый фон
-        img_rgb = img.convert("RGB")
-        bg = Image.new("RGB", img_rgb.size, (255, 255, 255))
-        # Ищем разницу
-        diff = ImageChops.difference(img_rgb, bg)
-        # Где не белое, там границы
-        bbox = diff.getbbox()
-
-        # Если нашли, обрезаем
-        if bbox:
-            left = max(0, bbox[0] - margin)
-            upper = max(0, bbox[1] - margin)
-            right = min(img_rgb.width, bbox[2] + margin)
-            lower = min(img_rgb.height, bbox[3] + margin)
-            return img.crop((left, upper, right, lower))
-    except Exception as e:
-        # Если ошибка, пишем
-        logger.warning("Ошибка при обрезке полей: %s", e)
-    return img
-
-
-class DocumentConverter:
-    """Главный класс, всё конвертирует."""
-
-    def __init__(self, config_path):
-        """Читает конфиг и готовит пути."""
-        self.config = self.load_config(config_path)
-
-        # Делаем пути абсолютными
-        self.source_dir = os.path.abspath(self.config["source_dir"])
-        self.output_dir = os.path.abspath(self.config["output_dir"])
-        self.db_path = os.path.abspath(self.config["json_path"])
-
-        # Путь к списку
-        list_path_config = self.config.get("list_json_path")
-        if list_path_config:
-            self.list_json_path = os.path.abspath(list_path_config)
-        else:
-            # Или делаем сами
-            base, ext = os.path.splitext(self.db_path)
-            self.list_json_path = f"{base}_list{ext}"
-
-        # Потоки и DPI
-        self.max_workers = max(1, int(self.config.get("max_workers", 4)))
-        self.dpi = int(self.config.get("png_dpi", 150))
-
-        # База и папка вывода
-        self.db = DatabaseManager(self.db_path, self.list_json_path)
-        os.makedirs(self.output_dir, exist_ok=True)
-
-        # Статистика
-        self.stats = {
-            "new": 0,
-            "updated": 0,
-            "unchanged": 0,
-            "errors": 0,
-            "deleted": 0
-        }
+class Files:
+    """Хэш, обрезка, проверка программ."""
 
     @staticmethod
-    def load_config(config_path):
-        """Читает config.json."""
-        # Если нет файла, ошибка
-        if not os.path.isfile(config_path):
-            raise FileNotFoundError("Файл конфигурации не найден: " + config_path)
+    def sha256(path):
+        """Считает хэш файла."""
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
 
-        # Читаем JSON
-        with open(config_path, "r", encoding="utf-8") as file:
-            config = json.load(file)
+    @staticmethod
+    def strip_hash(name):
+        """Убирает 4 символа хэша в начале."""
+        return re.sub(r"^[a-fA-F0-9]{4}_", "", name)
 
-        # Проверяем поля
-        required = ("source_dir", "output_dir", "json_path")
-        missing = [key for key in required if key not in config]
-        if missing:
-            raise ValueError("В config.json отсутствуют поля: " + ", ".join(missing))
+    @staticmethod
+    def crop(img, margin=0):
+        """Обрезает белые поля."""
+        try:
+            rgb = img.convert("RGB")
+            diff = ImageChops.difference(rgb, Image.new("RGB", rgb.size, (255, 255, 255)))
+            box = diff.getbbox()
+            if box:
+                l = max(0, box[0] - margin)
+                u = max(0, box[1] - margin)
+                r = min(rgb.width, box[2] + margin)
+                d = min(rgb.height, box[3] + margin)
+                return img.crop((l, u, r, d))
+        except Exception as e:
+            log.warning("Обрезка не вышла: %s", e)
+        return img
 
-        return config
+    @staticmethod
+    def check_deps():
+        """Проверяет libreoffice и pdftoppm."""
+        miss = [c for c in ("libreoffice", "pdftoppm") if not shutil.which(c)]
+        if miss:
+            raise RuntimeError("Нет программ: " + ", ".join(miss))
 
-    def make_base_image_name(self, source_file):
-        """Делает имя картинки без хэша."""
-        # Путь относительно исходной папки
-        relative_path = os.path.relpath(source_file, self.source_dir)
-        path_without_extension, ext = os.path.splitext(relative_path)
-        ext_lower = ext.lower()
 
-        # Картинки имеют своё расширение, остальные .png
-        if ext_lower in IMAGE_EXTENSIONS:
-            target_ext = ext_lower
-        else:
-            target_ext = ".png"
+class Converter:
+    """Главный класс."""
 
-        # Меняем слэши на подчёркивания
-        normalized_name_part = os.path.normpath(path_without_extension)
-        transformed_name = normalized_name_part.replace(os.sep, "_")
+    def __init__(self, cfg_path):
+        """Читает конфиг и готовит пути."""
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
 
-        # Добавляем исходное расширение
-        original_ext_without_dot = ext_lower[1:] if ext_lower else "noext"
-        if original_ext_without_dot:
-            transformed_name = f"{transformed_name}_{original_ext_without_dot}"
+        for k in ("source_dir", "output_dir", "json_path"):
+            if k not in cfg:
+                raise ValueError("Нет поля: " + k)
 
-        return transformed_name + target_ext
+        self.src = os.path.abspath(cfg["source_dir"])
+        self.out = os.path.abspath(cfg["output_dir"])
+        self.db_path = os.path.abspath(cfg["json_path"])
+        self.list_path = os.path.abspath(cfg.get("list_json_path")
+                                         or os.path.splitext(self.db_path)[0] + "_list.json")
+        self.workers = max(1, int(cfg.get("max_workers", 4)))
+        self.dpi = int(cfg.get("png_dpi", 150))
 
-    def make_image_name(self, source_file, file_hash):
-        """Делает имя картинки с хэшем в начале."""
-        base_name = self.make_base_image_name(source_file)
-        prefix = file_hash[:4] if file_hash else ""
-        return f"{prefix}_{base_name}" if prefix else base_name
+        self.db = DB(self.db_path, self.list_path)
+        self.files = Files()
+        os.makedirs(self.out, exist_ok=True)
+        self.stats = {"new": 0, "updated": 0, "unchanged": 0, "errors": 0, "deleted": 0}
 
-    def find_existing_entry(self, base_name):
-        """Ищет запись по имени без хэша."""
-        # Идём по всем записям
-        for img_name, info in self.db.data.items():
-            if strip_hash_prefix(img_name) == base_name:
-                return img_name, info
+    def base_name(self, path):
+        """Имя картинки без хэша."""
+        rel = os.path.relpath(path, self.src)
+        noext, ext = os.path.splitext(rel)
+        ext = ext.lower()
+        target = ext if ext in IMGS else ".png"
+        name = os.path.normpath(noext).replace(os.sep, "_")
+        return f"{name}_{ext[1:] if ext else 'noext'}{target}"
+
+    def image_name(self, path, h):
+        """Имя картинки с хэшем."""
+        return f"{h[:4]}_{self.base_name(path)}" if h else self.base_name(path)
+
+    def find_old(self, base):
+        """Ищет старую запись."""
+        for name, info in self.db.data.items():
+            if self.files.strip_hash(name) == base:
+                return name, info
         return None, None
 
-    def convert_to_pdf(self, source_file, temp_dir):
+    def to_pdf(self, src, tmp):
         """Делает PDF через LibreOffice."""
-        # Профиль LibreOffice
-        profile_dir = os.path.join(temp_dir, "libreoffice_profile")
-        os.makedirs(profile_dir, exist_ok=True)
+        prof = os.path.join(tmp, "prof")
+        os.makedirs(prof, exist_ok=True)
+        ext = os.path.splitext(src)[1].lower()
+        spec = ('pdf:calc_pdf_Export:{"SinglePageSheets":{"type":"boolean","value":"true"}}'
+                if ext in (".xls", ".xlsx") else "pdf")
+        cmd = ["libreoffice", "--headless", "--convert-to", spec,
+               "--outdir", tmp, "-env:UserInstallation=file://" + os.path.abspath(prof), src]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode and spec != "pdf":
+            cmd[3] = "pdf"
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError("LibreOffice: " + (r.stderr.strip() or r.stdout.strip() or "ошибка"))
+        pdf = os.path.join(tmp, os.path.splitext(os.path.basename(src))[0] + ".pdf")
+        if not os.path.isfile(pdf):
+            raise RuntimeError("PDF не создан")
+        return pdf
 
-        ext = os.path.splitext(source_file)[1].lower()
+    def to_png(self, pdf, tmp, out_name):
+        """Делает одну длинную PNG из PDF."""
+        prefix = os.path.join(tmp, "page")
+        r = subprocess.run(["pdftoppm", "-png", "-r", str(self.dpi), pdf, prefix],
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError("pdftoppm: " + (r.stderr.strip() or r.stdout.strip() or "ошибка"))
 
-        # Для Excel делаем в одну страницу
-        if ext in (".xls", ".xlsx"):
-            convert_spec = 'pdf:calc_pdf_Export:{"SinglePageSheets":{"type":"boolean","value":"true"}}'
-        else:
-            convert_spec = 'pdf'
+        pages = [os.path.join(tmp, f) for f in os.listdir(tmp)
+                 if f.startswith("page-") and f.endswith(".png")]
+        pages.sort(key=lambda p: int(re.search(r"page-(\d+)", p).group(1)) if re.search(r"page-(\d+)", p) else 0)
+        if not pages:
+            raise RuntimeError("Нет страниц")
 
-        # Команда
-        command = [
-            "libreoffice",
-            "--headless",
-            "--convert-to", convert_spec,
-            "--outdir", temp_dir,
-            "-env:UserInstallation=file://" + os.path.abspath(profile_dir),
-            source_file
-        ]
+        imgs = [self.files.crop(Image.open(p)) for p in pages]
+        w = max(i.width for i in imgs)
+        h = sum(i.height for i in imgs)
+        combo = Image.new("RGB", (w, h), (255, 255, 255))
+        y = 0
+        for i in imgs:
+            combo.paste(i, ((w - i.width) // 2, y))
+            y += i.height
+            i.close()
+        self.files.crop(combo, 20).save(os.path.join(self.out, out_name))
+        return out_name
 
-        # Запускаем
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        # Если не вышло, пробуем обычный pdf
-        if result.returncode != 0 and convert_spec != 'pdf':
-            command[3] = 'pdf'
-            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-        # Если опять ошибка, ругаемся
-        if result.returncode != 0:
-            message = result.stderr.strip() or result.stdout.strip() or "неизвестная ошибка"
-            raise RuntimeError("Ошибка LibreOffice: " + message)
-
-        # Где PDF
-        pdf_name = os.path.splitext(os.path.basename(source_file))[0] + ".pdf"
-        pdf_path = os.path.join(temp_dir, pdf_name)
-
-        # Нет PDF, значит ошибка
-        if not os.path.isfile(pdf_path):
-            message = result.stderr.strip() or result.stdout.strip() or "PDF не создан"
-            raise RuntimeError("LibreOffice не создал PDF: " + message)
-
-        return pdf_path
-
-    def convert_pdf_to_png(self, pdf_path, temp_dir, target_image_name):
-        """Делает из PDF одну длинную PNG."""
-        final_path = os.path.join(self.output_dir, target_image_name)
-        temporary_prefix = os.path.join(temp_dir, "page")
-
-        # Команда pdftoppm
-        command = [
-            "pdftoppm",
-            "-png",
-            "-r", str(self.dpi),
-            pdf_path,
-            temporary_prefix
-        ]
-
-        # Запускаем
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        # Ошибка, значит ругаемся
-        if result.returncode != 0:
-            message = result.stderr.strip() or result.stdout.strip() or "неизвестная ошибка"
-            raise RuntimeError("Ошибка pdftoppm: " + message)
-
-        # Собираем страницы
-        page_files = []
-        for filename in os.listdir(temp_dir):
-            if filename.startswith("page-") and filename.endswith(".png"):
-                page_files.append(os.path.join(temp_dir, filename))
-
-        # Номер страницы
-        def get_page_number(filepath):
-            match = re.search(r"page-(\d+)\.png", os.path.basename(filepath))
-            return int(match.group(1)) if match else 0
-
-        # Сортируем
-        page_files.sort(key=get_page_number)
-
-        # Пусто, значит ошибка
-        if not page_files:
-            raise RuntimeError("pdftoppm не создал ни одного изображения страниц")
-
-        # Обрезаем каждую
-        cropped_pages = []
-        for p in page_files:
-            with Image.open(p) as img:
-                cropped = crop_image_bbox(img, margin=0)
-                cropped_pages.append(cropped)
-
-        # Размеры итоговой
-        max_width = max(img.width for img in cropped_pages)
-        total_height = sum(img.height for img in cropped_pages)
-
-        # Склеиваем
-        combined_image = Image.new("RGB", (max_width, total_height), (255, 255, 255))
-        y_offset = 0
-
-        for img in cropped_pages:
-            x_offset = (max_width - img.width) // 2
-            combined_image.paste(img, (x_offset, y_offset))
-            y_offset += img.height
-            img.close()
-
-        # Ещё раз обрезаем и сохраняем
-        final_image = crop_image_bbox(combined_image, margin=20)
-        final_image.save(final_path)
-
-        return target_image_name
-
-    def process_file(self, source_file, force=False):
+    def process(self, src, force=False):
         """Обрабатывает один файл."""
-        current_hash = calculate_sha256(source_file)
-        base_name = self.make_base_image_name(source_file)
+        h = self.files.sha256(src)
+        base = self.base_name(src)
+        old_name, info = self.find_old(base)
+        old_h = info.get("hash", "") if isinstance(info, dict) else ""
+        is_new = info is None
 
-        # Ищем старую запись
-        old_image_name, existing_info = self.find_existing_entry(base_name)
+        if not (is_new or h != old_h or force):
+            return "unchanged", src, {}, None
 
-        old_hash = existing_info.get("hash", "") if isinstance(existing_info, dict) else ""
-        is_new = existing_info is None
-        is_changed = is_new or current_hash != old_hash
+        new_name = self.image_name(src, h)
+        old_del = old_name if old_name and old_name != new_name else None
+        ext = os.path.splitext(src)[1].lower()
 
-        # Если не изменилось и не force, пропускаем
-        if not is_changed and not force:
-            return "unchanged", source_file, {}, None
+        if ext in IMGS:
+            dst = os.path.join(self.out, new_name)
+            shutil.copyfile(src, dst)
+            with Image.open(dst) as im:
+                self.files.crop(im, 20).save(dst)
+        else:
+            tmp = tempfile.mkdtemp(prefix="conv_", dir=self.out)
+            try:
+                pdf = self.to_pdf(src, tmp)
+                new_name = self.to_png(pdf, tmp, new_name)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
 
-        # Новое имя
-        new_image_name = self.make_image_name(source_file, current_hash)
-        old_to_remove = old_image_name if (old_image_name and old_image_name != new_image_name) else None
+        status = "new" if is_new else "updated"
+        return status, src, {new_name: {"hash": h}}, old_del
 
-        ext = os.path.splitext(source_file)[1].lower()
-
-        # Если картинка, копируем и обрезаем
-        if ext in IMAGE_EXTENSIONS:
-            final_path = os.path.join(self.output_dir, new_image_name)
-            shutil.copyfile(source_file, final_path)
-            with Image.open(final_path) as img:
-                cropped = crop_image_bbox(img, margin=20)
-                cropped.save(final_path)
-
-            new_data = {
-                new_image_name: {
-                    "hash": current_hash
-                }
-            }
-
-            status = "new" if is_new else "updated"
-            return status, source_file, new_data, old_to_remove
-
-        # Иначе создаём временную папку
-        temporary_dir = tempfile.mkdtemp(
-            prefix="document_converter_",
-            dir=self.output_dir
-        )
-
-        try:
-            # Сначала PDF, потом PNG
-            pdf_path = self.convert_to_pdf(source_file, temporary_dir)
-            image_name = self.convert_pdf_to_png(
-                pdf_path,
-                temporary_dir,
-                new_image_name
-            )
-
-            new_data = {
-                image_name: {
-                    "hash": current_hash
-                }
-            }
-
-            status = "new" if is_new else "updated"
-            return status, source_file, new_data, old_to_remove
-
-        finally:
-            # Чистим временную папку
-            shutil.rmtree(temporary_dir, ignore_errors=True)
-
-    def scan_files(self):
+    def scan(self):
         """Ищет все нужные файлы."""
-        files = []
-
-        # Идём по папкам
-        for root, _, names in os.walk(self.source_dir):
-            for name in names:
-                # Пропускаем временные и скрытые
-                if name.startswith("~$") or name.startswith("."):
+        found = []
+        for root, _, names in os.walk(self.src):
+            for n in names:
+                if n.startswith(("~$", ".")):
                     continue
+                if os.path.splitext(n)[1].lower() in ALL:
+                    found.append(os.path.abspath(os.path.join(root, n)))
+        return found
 
-                extension = os.path.splitext(name)[1].lower()
-                # Не наше расширение, пропускаем
-                if extension not in SUPPORTED_EXTENSIONS:
-                    continue
-
-                files.append(os.path.abspath(os.path.join(root, name)))
-
-        return files
-
-    def remove_deleted_sources(self, current_files):
-        """Удаляет картинки файлов, которых больше нет."""
-        # Базовые имена текущих файлов
-        valid_base_names = {self.make_base_image_name(f) for f in current_files}
-        # Устаревшие записи
-        stale_images = [
-            img_name for img_name in self.db.data.keys()
-            if strip_hash_prefix(img_name) not in valid_base_names
-        ]
-
-        # Удаляем
-        for img_name in stale_images:
-            self.db.remove_photos([img_name], self.output_dir)
+    def clean(self, files):
+        """Удаляет картинки пропавших файлов."""
+        valid = {self.base_name(f) for f in files}
+        for name in [n for n in self.db.data if self.files.strip_hash(n) not in valid]:
+            self.db.remove([name], self.out)
             self.stats["deleted"] += 1
-            logger.info("Удалено изображение отсутствующего файла: %s", img_name)
+            log.info("Удалено: %s", name)
 
     def run(self, force=False):
         """Главный запуск."""
-        # Проверяем папку
-        if not os.path.isdir(self.source_dir):
-            raise NotADirectoryError("Исходная директория не найдена: " + self.source_dir)
+        if not os.path.isdir(self.src):
+            raise NotADirectoryError("Нет папки: " + self.src)
 
-        files = self.scan_files()
+        files = self.scan()
+        if any(os.path.splitext(f)[1].lower() in DOCS for f in files):
+            self.files.check_deps()
 
-        # Есть документы, значит проверяем программы
-        has_documents = any(os.path.splitext(f)[1].lower() in DOC_EXTENSIONS for f in files)
-        if has_documents:
-            check_dependencies()
+        log.info("Обход: %s", self.src)
+        self.clean(set(files))
+        log.info("Файлов: %d, потоков: %d", len(files), self.workers)
 
-        logger.info("Запуск обхода директории: %s", self.source_dir)
-
-        current_files = set(files)
-        # Сначала удаляем лишнее
-        self.remove_deleted_sources(current_files)
-
-        logger.info(
-            "Найдено файлов: %d. Запуск в %d потоков...",
-            len(files),
-            self.max_workers
-        )
-
-        # Потоки
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            tasks = {}
-
-            # Каждый файл это задача
-            for source_file in files:
-                future = executor.submit(
-                    self.process_file,
-                    source_file,
-                    force
-                )
-                tasks[future] = source_file
-
-            # Ждём готовые
-            for future in as_completed(tasks):
-                source_file = tasks[future]
-
+        with ThreadPoolExecutor(self.workers) as ex:
+            futs = {ex.submit(self.process, f, force): f for f in files}
+            for fut in as_completed(futs):
+                src = futs[fut]
                 try:
-                    status, source_path, new_data, old_to_remove = future.result()
-
-                    # Удаляем старое, если надо
-                    if old_to_remove:
-                        self.db.remove_photos([old_to_remove], self.output_dir)
-
-                    # Не изменилось, просто считаем
-                    if status == "unchanged":
+                    st, path, data, old = fut.result()
+                    if old:
+                        self.db.remove([old], self.out)
+                    if st == "unchanged":
                         self.stats["unchanged"] += 1
-                        logger.info("Без изменений: %s", source_path)
+                        log.info("Без изменений: %s", path)
                         continue
-
-                    # Иначе обновляем
-                    self.db.data.update(new_data)
-                    self.stats[status] += 1
-                    label = "Новый" if status == "new" else "Обновлённый"
-                    logger.info("%s файл: %s", label, source_path)
-
-                except Exception as error:
-                    # Ошибка, считаем
+                    self.db.data.update(data)
+                    self.stats[st] += 1
+                    log.info("%s: %s", "Новый" if st == "new" else "Обновлён", path)
+                except Exception as e:
                     self.stats["errors"] += 1
-                    logger.error("Ошибка при обработке %s: %s", source_file, error)
+                    log.error("Ошибка %s: %s", src, e)
 
-        # Сохраняем и печатаем
         self.db.save()
-        logger.info("Основной JSON сохранён: %s", self.db_path)
-        logger.info("JSON со списком фото сохранён: %s", self.list_json_path)
-        self.print_stats()
-
-    def print_stats(self):
-        """Печатает статистику."""
-        logger.info("\nСТАТИСТИКА:")
-        logger.info(f"   Новые файлы: {self.stats['new']}")
-        logger.info(f"   Обновлённые файлы: {self.stats['updated']}")
-        logger.info(f"   Без изменений: {self.stats['unchanged']}")
-        logger.info(f"   Ошибки: {self.stats['errors']}")
-        logger.info(f"   Удалённые файлы: {self.stats['deleted']}")
+        log.info("JSON: %s", self.db_path)
+        log.info("Список: %s", self.list_path)
+        log.info("СТАТИСТИКА: new=%d, upd=%d, same=%d, err=%d, del=%d",
+                 self.stats["new"], self.stats["updated"],
+                 self.stats["unchanged"], self.stats["errors"], self.stats["deleted"])
 
 
-def main():
-    """Запуск программы."""
-    parser = argparse.ArgumentParser(
-        description="Конвертация документов в PNG и обработка изображений"
-    )
-    parser.add_argument(
-        "--config",
-        default="config.json",
-        help="Путь к config.json"
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Переконвертировать все документы"
-    )
+class App:
+    """Точка входа."""
 
-    args = parser.parse_args()
+    def __init__(self):
+        """Читает аргументы командной строки."""
+        p = argparse.ArgumentParser(description="Конвертер документов в PNG")
+        p.add_argument("--config", default="config.json")
+        p.add_argument("--force", action="store_true")
+        self.args = p.parse_args()
 
-    try:
-        # Создаём и запускаем
-        converter = DocumentConverter(args.config)
-        converter.run(force=args.force)
-
-    except Exception as error:
-        # Ошибка, пишем и выходим
-        logger.error("Ошибка: %s", error)
-        sys.exit(1)
+    def run(self):
+        """Создаёт конвертер и запускает."""
+        try:
+            Converter(self.args.config).run(self.args.force)
+        except Exception as e:
+            log.error("Ошибка: %s", e)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    App().run()
